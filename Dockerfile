@@ -1,6 +1,6 @@
 # 使用多階段建置來建立一個輕量的映像檔
 # 階段 1: 建置
-FROM golang:1.22-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 WORKDIR /app
 
