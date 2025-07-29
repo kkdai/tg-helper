@@ -1,0 +1,25 @@
+steps:
+# 1. 建置 Docker 映像檔
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['build', '-t', 'gcr.io/$PROJECT_ID/tg-helper:$COMMIT_SHA', '.']
+
+# 2. 推送 Docker 映像檔到 Google Container Registry
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['push', 'gcr.io/$PROJECT_ID/tg-helper:$COMMIT_SHA']
+
+# 3. 部署到 Cloud Run
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  entrypoint: gcloud
+  args:
+    - 'run'
+    - 'deploy'
+    - 'tg-helper' # Cloud Run 服務的名稱
+    - '--image=gcr.io/$PROJECT_ID/tg-helper:$COMMIT_SHA'
+    - '--region=asia-east1' # 您可以更換成您偏好的區域
+    - '--platform=managed'
+    - '--allow-unauthenticated' # 允許來自 Telegram 的公開請求
+    - '--set-env-vars=TELEGRAM_BOT_TOKEN=$_TELEGRAM_BOT_TOKEN' # 從 Cloud Build 的變數設定環境變數
+
+# 將建置好的映像檔名稱記錄下來
+images:
+- 'gcr.io/$PROJECT_ID/tg-helper:$COMMIT_SHA'
