@@ -37,10 +37,19 @@ func initDriveService(ctx context.Context) error {
 	}
 	log.Println("Successfully loaded credentials from environment variable.")
 
+		// 使用金鑰建立 Drive 服務
 	config, err := google.JWTConfigFromJSON([]byte(credentialsJSON), drive.DriveFileScope)
 	if err != nil {
 		return fmt.Errorf("failed to create JWT config from JSON: %v", err)
 	}
+
+	// 新增：設定要模擬的使用者
+	impersonateEmail := os.Getenv("IMPERSONATE_USER_EMAIL")
+	if impersonateEmail == "" {
+		return fmt.Errorf("IMPERSONATE_USER_EMAIL environment variable not set")
+	}
+	config.Subject = impersonateEmail
+	log.Printf("Impersonating user: %s", impersonateEmail)
 
 	client := config.Client(ctx)
 	driveService, err = drive.NewService(ctx, option.WithHTTPClient(client))
