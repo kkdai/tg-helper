@@ -190,12 +190,22 @@ func handleFile(message *tgbotapi.Message) {
 	// --- 以下與之前的檔案上傳邏輯相同 ---
 	var fileID string
 	var fileName string
+	var fileSize int64 // 使用 int64 來儲存檔案大小
+
 	if message.Document != nil {
-		fileID, fileName = message.Document.FileID, message.Document.FileName
+		fileID, fileName, fileSize = message.Document.FileID, message.Document.FileName, message.Document.FileSize
 	} else if len(message.Photo) > 0 {
 		photo := message.Photo[len(message.Photo)-1]
-		fileID, fileName = photo.FileID, fmt.Sprintf("%s.jpg", photo.FileID)
+		fileID, fileName, fileSize = photo.FileID, fmt.Sprintf("%s.jpg", photo.FileID), int64(photo.FileSize)
 	} else {
+		return
+	}
+
+	// 新增：檢查檔案大小是否超過 Telegram Bot API 的 20MB 下載限制
+	const maxFileSize = 20 * 1024 * 1024 // 20 MB
+	if fileSize > maxFileSize {
+		log.Printf("File size %d exceeds the 20MB limit for user %d.", fileSize, userID)
+		replyToUser(message.Chat.ID, message.MessageID, fmt.Sprintf("檔案大小為 %.2f MB，已超過 Telegram 機器人 20 MB 的下載限制，無法處理。", float64(fileSize)/1024/1024))
 		return
 	}
 
