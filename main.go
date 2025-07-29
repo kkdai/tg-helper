@@ -2,163 +2,259 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"time"
 
+	"cloud.google.com/go/firestore"
 	"github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/drive/v3"
-	"google.golang.org/api/googleapi" // 引入 googleapi 套件來解析詳細錯誤
 	"google.golang.org/api/option"
 )
 
+// --- 全域變數 ---
 var (
-	bot              *tgbotapi.BotAPI
-	driveService     *drive.Service
-	driveFolderID    string
-	telegramBotToken string
+	bot             *tgbotapi.BotAPI
+	oauth2Config    *oauth2.Config
+	firestoreClient *firestore.Client
+	gcpProjectID    string
 )
 
-// UPDATED: initDriveService with more logging
-func initDriveService(ctx context.Context) error {
-	log.Println("Initializing Google Drive service...")
-	driveFolderID = os.Getenv("GOOGLE_DRIVE_FOLDER_ID")
-	if driveFolderID == "" {
-		return fmt.Errorf("FATAL: GOOGLE_DRIVE_FOLDER_ID environment variable not set")
-	}
-	log.Printf("Using Google Drive Folder ID: %s", driveFolderID)
+const (
+	// Firestore 集合名稱
+	tokenCollection = "user_tokens"
+	stateCollection = "oauth_states"
+)
 
-	credentialsJSON := os.Getenv("GOOGLE_CREDENTIALS_JSON")
-	if credentialsJSON == "" {
-		return fmt.Errorf("FATAL: GOOGLE_CREDENTIALS_JSON environment variable not set")
-	}
-	log.Println("Successfully loaded credentials from environment variable.")
+// UserToken 用來儲存在 Firestore 中的使用者權杖
+type UserToken struct {
+	UserID       int64         `firestore:"user_id"`
+	RefreshToken string        `firestore:"refresh_token"`
+	TokenType    string        `firestore:"token_type"`
+	Expiry       time.Time     `firestore:"expiry"`
+	AccessToken  string        `firestore:"access_token"`
+	CreatedAt    time.Time     `firestore:"created_at"`
+}
 
-		// 使用金鑰建立 Drive 服務
-	config, err := google.JWTConfigFromJSON([]byte(credentialsJSON), drive.DriveFileScope)
+// --- 初始化 ---
+func initFirestore(ctx context.Context) error {
+	gcpProjectID = os.Getenv("GCP_PROJECT_ID")
+	if gcpProjectID == "" {
+		return fmt.Errorf("GCP_PROJECT_ID environment variable not set")
+	}
+
+	var err error
+	firestoreClient, err = firestore.NewClient(ctx, gcpProjectID)
 	if err != nil {
-		return fmt.Errorf("failed to create JWT config from JSON: %v", err)
+		return fmt.Errorf("failed to create firestore client: %v", err)
 	}
-
-	// 新增：設定要模擬的使用者
-	impersonateEmail := os.Getenv("IMPERSONATE_USER_EMAIL")
-	if impersonateEmail == "" {
-		return fmt.Errorf("IMPERSONATE_USER_EMAIL environment variable not set")
-	}
-	config.Subject = impersonateEmail
-	log.Printf("Impersonating user: %s", impersonateEmail)
-
-	client := config.Client(ctx)
-	driveService, err = drive.NewService(ctx, option.WithHTTPClient(client))
-	if err != nil {
-		return fmt.Errorf("failed to create drive service: %v", err)
-	}
-
-	log.Println("Google Drive service initialized successfully.")
 	return nil
 }
 
-// UPDATED: handleFile with more logging
-func handleFile(message *tgbotapi.Message) {
-	var fileID string
-	var fileName string
+func initOAuth2Config() error {
+	clientID := os.Getenv("GOOGLE_CLIENT_ID")
+	clientSecret := os.Getenv("GOOGLE_CLIENT_SECRET")
+	redirectURL := os.Getenv("GOOGLE_REDIRECT_URL") // e.g., https://your-service.run.app/oauth/callback
 
-	if message.Document != nil {
-		log.Printf("Received a document from user %s. FileName: %s", message.From.UserName, message.Document.FileName)
-		fileID = message.Document.FileID
-		fileName = message.Document.FileName
-	} else if len(message.Photo) > 0 {
-		photo := message.Photo[len(message.Photo)-1]
-		log.Printf("Received a photo from user %s. FileID: %s", message.From.UserName, photo.FileID)
-		fileID = photo.FileID
-		fileName = fmt.Sprintf("%s.jpg", fileID)
-	} else {
-		log.Println("Received a message that is not a document or photo. Ignoring.")
+	if clientID == "" || clientSecret == "" || redirectURL == "" {
+		return fmt.Errorf("GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, or GOOGLE_REDIRECT_URL not set")
+	}
+
+	oauth2Config = &oauth2.Config{
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		RedirectURL:  redirectURL,
+		Scopes:       []string{drive.DriveFileScope}, // 只要求上傳權限
+		Endpoint:     google.Endpoint,
+	}
+	return nil
+}
+
+// --- 主要邏輯 ---
+
+// 處理 /connect_drive 指令
+func handleConnectDrive(message *tgbotapi.Message) {
+	// 產生一個隨機的 state 字串來防止 CSRF 攻擊
+	b := make([]byte, 32)
+	rand.Read(b)
+	state := base64.URLEncoding.EncodeToString(b)
+
+	// 將 state 和使用者 ID 存到 Firestore，設定一個短的過期時間
+	ctx := context.Background()
+	_, err := firestoreClient.Collection(stateCollection).Doc(state).Set(ctx, map[string]interface{}{
+		"user_id":    message.From.ID,
+		"created_at": time.Now(),
+	})
+	if err != nil {
+		log.Printf("Failed to save state to firestore: %v", err)
+		replyToUser(message.Chat.ID, message.MessageID, "產生授權連結時發生錯誤，請稍後再試。")
 		return
 	}
 
-	log.Printf("Step 1: Getting file direct URL for FileID: %s", fileID)
+	// 產生授權 URL
+	authURL := oauth2Config.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.ApprovalForce)
+	replyToUser(message.Chat.ID, message.MessageID, "請點擊以下連結授權本 Bot 存取您的 Google Drive (僅限上傳權限)：\n\n"+authURL)
+}
+
+// 處理來自 Google 的 OAuth 回呼
+func oauthCallbackHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := context.Background()
+	state := r.URL.Query().Get("state")
+	code := r.URL.Query().Get("code")
+
+	// 1. 驗證 state
+	doc, err := firestoreClient.Collection(stateCollection).Doc(state).Get(ctx)
+	if err != nil {
+		http.Error(w, "Invalid state parameter. Please try again.", http.StatusBadRequest)
+		return
+	}
+	// 驗證後立即刪除 state，防止重複使用
+	defer doc.Ref.Delete(ctx)
+
+	var stateData struct {
+		UserID int64 `firestore:"user_id"`
+	}
+	doc.DataTo(&stateData)
+	userID := stateData.UserID
+
+	// 2. 用授權碼交換權杖
+	token, err := oauth2Config.Exchange(ctx, code)
+	if err != nil {
+		log.Printf("Failed to exchange token: %v", err)
+		http.Error(w, "Failed to exchange token.", http.StatusInternalServerError)
+		return
+	}
+
+	// 3. 將 Refresh Token 存到 Firestore
+	userToken := &UserToken{
+		UserID:       userID,
+		RefreshToken: token.RefreshToken,
+		AccessToken:  token.AccessToken,
+		TokenType:    token.TokenType,
+		Expiry:       token.Expiry,
+		CreatedAt:    time.Now(),
+	}
+
+	// 使用 UserID 作為文件 ID
+	_, err = firestoreClient.Collection(tokenCollection).Doc(fmt.Sprintf("%d", userID)).Set(ctx, userToken)
+	if err != nil {
+		log.Printf("Failed to save token to firestore: %v", err)
+		http.Error(w, "Failed to save token.", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("Successfully saved token for user %d", userID)
+	fmt.Fprintf(w, "授權成功！您現在可以回到 Telegram 傳送檔案給機器人了。")
+}
+
+// 處理檔案上傳
+func handleFile(message *tgbotapi.Message) {
+	ctx := context.Background()
+	userID := message.From.ID
+
+	// 1. 從 Firestore 取得使用者的權杖
+	doc, err := firestoreClient.Collection(tokenCollection).Doc(fmt.Sprintf("%d", userID)).Get(ctx)
+	if err != nil {
+		log.Printf("Token not found for user %d: %v", userID, err)
+		replyToUser(message.Chat.ID, message.MessageID, "找不到您的 Google Drive 授權，請先使用 /connect_drive 指令進行授權。")
+		return
+	}
+
+	var userToken UserToken
+	doc.DataTo(&userToken)
+
+	// 2. 建立一個使用使用者權杖的 HTTP client
+	token := &oauth2.Token{
+		AccessToken:  userToken.AccessToken,
+		TokenType:    userToken.TokenType,
+		RefreshToken: userToken.RefreshToken,
+		Expiry:       userToken.Expiry,
+	}
+	client := oauth2Config.Client(ctx, token)
+
+	// 3. 建立 Drive 服務
+	driveService, err := drive.NewService(ctx, option.WithHTTPClient(client))
+	if err != nil {
+		log.Printf("Failed to create drive service for user %d: %v", userID, err)
+		replyToUser(message.Chat.ID, message.MessageID, "建立 Google Drive 連線時發生錯誤。")
+		return
+	}
+
+	// --- 以下與之前的檔案上傳邏輯相同 ---
+	var fileID string
+	var fileName string
+	if message.Document != nil {
+		fileID, fileName = message.Document.FileID, message.Document.FileName
+	} else if len(message.Photo) > 0 {
+		photo := message.Photo[len(message.Photo)-1]
+		fileID, fileName = photo.FileID, fmt.Sprintf("%s.jpg", photo.FileID)
+	} else {
+		return
+	}
+
 	fileURL, err := bot.GetFileDirectURL(fileID)
 	if err != nil {
-		log.Printf("ERROR: Failed to get file URL: %v", err)
+		log.Printf("Failed to get file URL: %v", err)
 		replyToUser(message.Chat.ID, message.MessageID, "無法取得檔案，請稍後再試。")
 		return
 	}
-	log.Printf("Step 1 Success: Got file URL: %s", fileURL)
 
-	log.Printf("Step 2: Downloading file from Telegram...")
 	resp, err := http.Get(fileURL)
 	if err != nil {
-		log.Printf("ERROR: Failed to download file: %v", err)
+		log.Printf("Failed to download file: %v", err)
 		replyToUser(message.Chat.ID, message.MessageID, "無法下載檔案，請稍後再試。")
 		return
 	}
 	defer resp.Body.Close()
-	log.Printf("Step 2 Success: File downloaded. HTTP Status: %s", resp.Status)
 
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("ERROR: Telegram returned non-200 status code: %s", resp.Status)
-		replyToUser(message.Chat.ID, message.MessageID, "從 Telegram 下載檔案時發生錯誤。")
-		return
-	}
+	// 注意：這裡不再需要 Parents，因為檔案會直接上傳到使用者的 "My Drive"
+	driveFile := &drive.File{Name: fileName}
 
-	driveFile := &drive.File{
-		Name:    fileName,
-		Parents: []string{driveFolderID},
-	}
-
-	log.Printf("Step 3: Uploading file '%s' to Drive Folder ID '%s'", fileName, driveFolderID)
 	_, err = driveService.Files.Create(driveFile).Media(resp.Body).Do()
 	if err != nil {
-		// 新增的詳細錯誤日誌
-		log.Printf("ERROR: Failed to upload to Drive: %v", err)
-		if gerr, ok := err.(*googleapi.Error); ok {
-			log.Printf("Google API Error Details: Code=%d, Message=%s", gerr.Code, gerr.Message)
-			for _, e := range gerr.Errors {
-				log.Printf("Reason: %s, Message: %s", e.Reason, e.Message)
-			}
-		}
-		replyToUser(message.Chat.ID, message.MessageID, "上傳到 Google Drive 失敗。")
+		log.Printf("Failed to upload to Drive for user %d: %v", userID, err)
+		replyToUser(message.Chat.ID, message.MessageID, "上傳到您的 Google Drive 失敗。")
 		return
 	}
 
-	log.Printf("Step 3 Success: Successfully uploaded file '%s' to Drive.", fileName)
-	replyToUser(message.Chat.ID, message.MessageID, fmt.Sprintf("檔案 '%s' 已成功上傳到 Google Drive！", fileName))
+	log.Printf("Successfully uploaded file '%s' to Drive for user %d.", fileName, userID)
+	replyToUser(message.Chat.ID, message.MessageID, fmt.Sprintf("檔案 '%s' 已成功上傳到您的 Google Drive！", fileName))
 }
 
-func replyToUser(chatID int64, replyToMessageID int, text string) {
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ReplyToMessageID = replyToMessageID
-	if _, err := bot.Send(msg); err != nil {
-		log.Printf("ERROR: could not send reply message: %v", err)
-	}
-}
-
+// --- Webhook 和主函式 ---
 func webhookHandler(w http.ResponseWriter, r *http.Request) {
 	var update tgbotapi.Update
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
-		log.Printf("ERROR: could not decode incoming update: %v", err)
+		log.Printf("could not decode incoming update: %v", err)
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 
 	if update.Message == nil {
-		log.Println("Received an update with no message. Ignoring.")
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	log.Printf("Received message from @%s (ChatID: %d)", update.Message.From.UserName, update.Message.Chat.ID)
-
-	if update.Message.IsCommand() || update.Message.Text != "" {
-		log.Printf("Message is a text or command: '%s'", update.Message.Text)
-		replyToUser(update.Message.Chat.ID, update.Message.MessageID, "這是一個 Echo Bot，請傳送檔案給我，我會幫您上傳到 Google Drive。")
-	} else {
-		log.Println("Message is a file/photo, processing with handleFile...")
+	if update.Message.IsCommand() {
+		switch update.Message.Command() {
+		case "start":
+			replyToUser(update.Message.Chat.ID, update.Message.MessageID, "歡迎使用！請使用 /connect_drive 來授權 Google Drive。")
+		case "connect_drive":
+			handleConnectDrive(update.Message)
+		default:
+			replyToUser(update.Message.Chat.ID, update.Message.MessageID, "無法辨識的指令。")
+		}
+	} else if update.Message.Document != nil || len(update.Message.Photo) > 0 {
 		handleFile(update.Message)
+	} else {
+		replyToUser(update.Message.Chat.ID, update.Message.MessageID, "請傳送檔案或使用 /connect_drive 指令。")
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -166,22 +262,20 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	ctx := context.Background()
+	log.Println("Starting bot application with OAuth flow...")
 
-	log.Println("Starting bot application...")
-
-	telegramBotToken = os.Getenv("TELEGRAM_BOT_TOKEN")
-	if telegramBotToken == "" {
-		log.Fatal("FATAL: TELEGRAM_BOT_TOKEN environment variable not set")
-	}
 	var err error
-	bot, err = tgbotapi.NewBotAPI(telegramBotToken)
+	bot, err = tgbotapi.NewBotAPI(os.Getenv("TELEGRAM_BOT_TOKEN"))
 	if err != nil {
 		log.Fatalf("FATAL: Failed to create bot API: %v", err)
 	}
-	log.Println("Telegram Bot API initialized successfully.")
 
-	if err := initDriveService(ctx); err != nil {
-		log.Fatalf("FATAL: Failed to initialize Drive service: %v", err)
+	if err := initFirestore(ctx); err != nil {
+		log.Fatalf("FATAL: Failed to initialize Firestore: %v", err)
+	}
+
+	if err := initOAuth2Config(); err != nil {
+		log.Fatalf("FATAL: Failed to initialize OAuth2 config: %v", err)
 	}
 
 	port := os.Getenv("PORT")
@@ -189,10 +283,21 @@ func main() {
 		port = "8080"
 	}
 
+	// 新增 /oauth/callback 路由
+	http.HandleFunc("/oauth/callback", oauthCallbackHandler)
+	// Telegram Webhook 路由
 	http.HandleFunc("/", webhookHandler)
 
 	log.Printf("Server starting on port %s", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		log.Fatalf("FATAL: failed to start server: %v", err)
+	}
+}
+
+func replyToUser(chatID int64, replyToMessageID int, text string) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyToMessageID = replyToMessageID
+	if _, err := bot.Send(msg); err != nil {
+		log.Printf("ERROR: could not send reply message: %v", err)
 	}
 }
