@@ -109,7 +109,7 @@ func handleFile(message *tgbotapi.Message) {
 		if gerr, ok := err.(*googleapi.Error); ok {
 			log.Printf("Google API Error Details: Code=%d, Message=%s", gerr.Code, gerr.Message)
 			for _, e := range gerr.Errors {
-				log.Printf("Domain: %s, Reason: %s, Message: %s", e.Domain, e.Reason, e.Message)
+				log.Printf("Reason: %s, Message: %s", e.Reason, e.Message)
 			}
 		}
 		replyToUser(message.Chat.ID, message.MessageID, "上傳到 Google Drive 失敗。")
