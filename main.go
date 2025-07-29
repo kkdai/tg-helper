@@ -8,8 +8,7 @@ import (
 	"net/http"
 	"os"
 
-	secretmanager "cloud.google.com/go/secretmanager/apiv1"
-	"cloud.google.com/go/secretmanager/apiv1/secretmanagerpb"
+	// Secret Manager 的引用已被移除
 	"github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/drive/v3"
@@ -17,49 +16,28 @@ import (
 )
 
 var (
-	bot               *tgbotapi.BotAPI
-	driveService      *drive.Service
-	driveFolderID     string
-	telegramBotToken  string
-	gcpProjectID      string
-	credentialsSecret string
+	bot              *tgbotapi.BotAPI
+	driveService     *drive.Service
+	driveFolderID    string
+	telegramBotToken string
 )
 
-// NEW: 初始化 Google Drive 服務
+// UPDATED: 初始化 Google Drive 服務
 func initDriveService(ctx context.Context) error {
 	// 從環境變數讀取設定
 	driveFolderID = os.Getenv("GOOGLE_DRIVE_FOLDER_ID")
 	if driveFolderID == "" {
 		return fmt.Errorf("GOOGLE_DRIVE_FOLDER_ID environment variable not set")
 	}
-	gcpProjectID = os.Getenv("GCP_PROJECT_ID")
-	if gcpProjectID == "" {
-		return fmt.Errorf("GCP_PROJECT_ID environment variable not set")
-	}
-	credentialsSecret = os.Getenv("CREDENTIALS_SECRET")
-	if credentialsSecret == "" {
-		return fmt.Errorf("CREDENTIALS_SECRET environment variable not set")
-	}
 
-	// 從 Secret Manager 獲取服務帳號金鑰
-	secretName := fmt.Sprintf("projects/%s/secrets/%s/versions/latest", gcpProjectID, credentialsSecret)
-	smClient, err := secretmanager.NewClient(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to create secretmanager client: %v", err)
+	// 直接從環境變數讀取 JSON 憑證內容
+	credentialsJSON := os.Getenv("GOOGLE_CREDENTIALS_JSON")
+	if credentialsJSON == "" {
+		return fmt.Errorf("GOOGLE_CREDENTIALS_JSON environment variable not set")
 	}
-	defer smClient.Close()
-
-	req := &secretmanagerpb.AccessSecretVersionRequest{
-		Name: secretName,
-	}
-	result, err := smClient.AccessSecretVersion(ctx, req)
-	if err != nil {
-		return fmt.Errorf("failed to access secret version: %v", err)
-	}
-	credentialsJSON := result.Payload.Data
 
 	// 使用金鑰建立 Drive 服務
-	config, err := google.JWTConfigFromJSON(credentialsJSON, drive.DriveFileScope)
+	config, err := google.JWTConfigFromJSON([]byte(credentialsJSON), drive.DriveFileScope)
 	if err != nil {
 		return fmt.Errorf("failed to create JWT config from JSON: %v", err)
 	}
@@ -72,7 +50,7 @@ func initDriveService(ctx context.Context) error {
 	return nil
 }
 
-// NEW: 處理檔案上傳
+// 處理檔案上傳 (此函式未變更)
 func handleFile(message *tgbotapi.Message) {
 	var fileID string
 	var fileName string
@@ -81,15 +59,13 @@ func handleFile(message *tgbotapi.Message) {
 		fileID = message.Document.FileID
 		fileName = message.Document.FileName
 	} else if len(message.Photo) > 0 {
-		// 取最大尺寸的照片
 		photo := message.Photo[len(message.Photo)-1]
 		fileID = photo.FileID
-		fileName = fmt.Sprintf("%s.jpg", fileID) // Telegram 照片沒有檔名，我們自己產生一個
+		fileName = fmt.Sprintf("%s.jpg", fileID)
 	} else {
-		return // 不是文件或照片
+		return
 	}
 
-	// 1. 從 Telegram 取得檔案下載連結
 	fileURL, err := bot.GetFileDirectURL(fileID)
 	if err != nil {
 		log.Printf("Failed to get file URL: %v", err)
@@ -97,7 +73,6 @@ func handleFile(message *tgbotapi.Message) {
 		return
 	}
 
-	// 2. 下載檔案
 	resp, err := http.Get(fileURL)
 	if err != nil {
 		log.Printf("Failed to download file: %v", err)
@@ -106,7 +81,6 @@ func handleFile(message *tgbotapi.Message) {
 	}
 	defer resp.Body.Close()
 
-	// 3. 上傳到 Google Drive
 	driveFile := &drive.File{
 		Name:    fileName,
 		Parents: []string{driveFolderID},
@@ -123,7 +97,7 @@ func handleFile(message *tgbotapi.Message) {
 	replyToUser(message.Chat.ID, message.MessageID, fmt.Sprintf("檔案 '%s' 已成功上傳到 Google Drive！", fileName))
 }
 
-// 輔助函式，用來回覆使用者
+// 輔助函式，用來回覆使用者 (此函式未變更)
 func replyToUser(chatID int64, replyToMessageID int, text string) {
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ReplyToMessageID = replyToMessageID
@@ -145,12 +119,10 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 檢查是文字訊息還是檔案
 	if update.Message.IsCommand() || update.Message.Text != "" {
 		log.Printf("[%s] %s", update.Message.From.UserName, update.Message.Text)
 		replyToUser(update.Message.Chat.ID, update.Message.MessageID, "這是一個 Echo Bot，請傳送檔案給我，我會幫您上傳到 Google Drive。")
 	} else {
-		// 是檔案，交給 handleFile 處理
 		handleFile(update.Message)
 	}
 
@@ -160,7 +132,6 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	ctx := context.Background()
 
-	// 初始化 Telegram Bot
 	telegramBotToken = os.Getenv("TELEGRAM_BOT_TOKEN")
 	if telegramBotToken == "" {
 		log.Fatal("TELEGRAM_BOT_TOKEN environment variable not set")
@@ -171,7 +142,6 @@ func main() {
 		log.Fatalf("Failed to create bot: %v", err)
 	}
 
-	// 初始化 Google Drive 服務
 	if err := initDriveService(ctx); err != nil {
 		log.Fatalf("Failed to initialize Drive service: %v", err)
 	}
