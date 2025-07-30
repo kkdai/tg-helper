@@ -193,7 +193,7 @@ func handleFile(message *tgbotapi.Message) {
 	var fileSize int64 // 使用 int64 來儲存檔案大小
 
 	if message.Document != nil {
-		fileID, fileName, fileSize = message.Document.FileID, message.Document.FileName, message.Document.FileSize
+		fileID, fileName, fileSize = message.Document.FileID, message.Document.FileName, int64(message.Document.FileSize)
 	} else if len(message.Photo) > 0 {
 		photo := message.Photo[len(message.Photo)-1]
 		fileID, fileName, fileSize = photo.FileID, fmt.Sprintf("%s.jpg", photo.FileID), int64(photo.FileSize)
