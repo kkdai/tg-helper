@@ -17,6 +17,8 @@ import (
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // --- 全域變數 ---
@@ -162,8 +164,13 @@ func handleFile(message *tgbotapi.Message) {
 	// 1. 從 Firestore 取得使用者的權杖
 	doc, err := firestoreClient.Collection(tokenCollection).Doc(fmt.Sprintf("%d", userID)).Get(ctx)
 	if err != nil {
-		log.Printf("Token not found for user %d: %v", userID, err)
-		replyToUser(message.Chat.ID, message.MessageID, "找不到您的 Google Drive 授權，請先使用 /connect_drive 指令進行授權。")
+		if status.Code(err) == codes.NotFound {
+			log.Printf("Token not found for user %d: %v", userID, err)
+			replyToUser(message.Chat.ID, message.MessageID, "您的 Google Drive 帳號尚未連結，請使用 /connect_drive 指令來重新連結。")
+		} else {
+			log.Printf("Failed to retrieve token for user %d: %v", userID, err)
+			replyToUser(message.Chat.ID, message.MessageID, "讀取您的授權時發生錯誤，請稍後再試。")
+		}
 		return
 	}
 
